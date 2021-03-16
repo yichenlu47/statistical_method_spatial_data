@@ -1,0 +1,442 @@
+---
+title: "BIOST/EPI 554 Problem Set 2"
+author: "Yichen Lu"
+date: "2/17/2021"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+# rm(list = ls())
+knitr::opts_chunk$set(echo = FALSE, include=FALSE, message = FALSE, warning = FALSE, cache = TRUE)
+library(SpatialEpi)
+library(RColorBrewer)
+library(ggplot2)
+library(ggridges)
+library(INLA)
+library(rgdal)
+library(spdep)
+library(dplyr)
+library(fields)
+library(maptools)
+library(geoR)
+library(sp)
+library(gstat)
+options("scipen"=100)
+```
+
+#### PROBLEM 1
+(a) Examine the level of clustering of the residuals using Moran’s statistic.
+
+```{r}
+## PROBLEM 1
+# (a)
+
+# summarize and merge data based on hw1 solution
+ohio_data <- read.table("C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data/ohio_data-1.txt", header = TRUE, sep = " ")
+ohio_county <- ohio_data %>% group_by(fips) %>%
+  summarise(year = unique(year),
+            deaths = sum(deaths),
+            popn = sum(popn),
+            exp = unique(county_level_E))
+
+ohio_map <- readOGR(dsn = "C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data", layer = "ohio_map")
+ohio_map@data$deaths <- ohio_county$deaths
+ohio_map@data$exp <- ohio_county$exp
+ohio_map@data$popn <- ohio_county$popn
+
+tmp1 <- merge(x = ohio_map@data[,c("STATEFP00",
+                                   "COUNTYFP00",
+                                   "CNTYIDFP00",
+                                   "NAME00")],
+              y = ohio_county,
+              by.x = 'CNTYIDFP00',
+              by.y = 'fips',
+              sort = FALSE)
+
+tmp2 <- ohio_county[match(ohio_map@data$CNTYIDFP00,
+                          ohio_county$fips),]
+tmp2$county_name <- ohio_map@data$NAME00[match(tmp2$fips, ohio_map@data$CNTYIDFP00)]
+ohio_county <- tmp2
+rm(tmp1, tmp2)
+
+# create a neighborhood list
+ohio.nb <- poly2nb(ohio_map)
+
+# evaluate moran's test
+col.W <- nb2listw(ohio.nb, style = "W", zero.policy = TRUE)
+quasipmod <- glm(deaths~1,offset=log(exp),
+                 data=ohio_map@data,family=quasipoisson())
+sidsres <- residuals(quasipmod,type="pearson")
+m.test <- moran.test(sidsres,col.W)
+p <- m.test$p.value
+```
+
+*Spatial autocorrelation is evaluated using Moran's test with the "W" style weight function. We mapped the residuals to get a visual on the clustering. Based on the p-value from Moran's test `r p`, we reject the null hypothesis that there's clustering at a significance level of 0.05.*
+
+```{r, include = TRUE}
+#map the residuals to get a visual on the clustering
+ohio_map$res <- sidsres
+par(mar=c(.1,.1,.1,.1))
+spplot(ohio_map,"res", main=list(label="Map of residuals (no clustering detected)",cex=1.5))
+```
+
+
+(b) Examine the level of clustering of the residuals using Geary’s statistic.
+
+```{r}
+g.test <- geary.test(sidsres, col.W)
+p <- g.test$p.value
+```
+
+*We also evaluated spatial autocorrelation with Geary's test with the "W" style weight function. We Based on the p-value from Geary's test `r p`, we reject the null hypothesis that there's clustering at a significance level of 0.05.*
+
+#### PROBLEM 2
+Cluster Detection for the Ohio lung cancer data. Perform cluster detection on these data using the SatScan method of Kulldorff. Use a significance level of 0.05, and a maximum population size of 20%
+
+```{r, include = FALSE}
+## problem 2
+# geo <- for(i in 1:88){ohio_map@polygons[[i]]@labpt}
+# gCentroid
+geo <- latlong2grid(coordinates(ohio_map))
+
+# referencep <- sum(ohio_map@data$deaths)/sum(ohio_map@data$popn)
+population <- ohio_map@data$popn
+cases <- ohio_map@data$deaths
+expected <- ohio_map@data$exp
+
+#significance level of 0.05, and a maximum population size of 20%
+pop.upper.bound <- 0.2
+n.simulations <- 1000
+alpha.level <- 0.05
+
+#StatScan
+Kpoisson <- kulldorff(geo,cases,population,expected.cases=NULL, 
+                      pop.upper.bound, n.simulations, alpha.level, plot=T)
+Kcluster <- Kpoisson$most.likely.cluster$location.IDs.included
+```
+
+*The location IDs identified as the most likely cluster include `r Kcluster`. They are plotted in the graph below.*
+
+```{r, include = TRUE}
+# plot
+ohio_poly = SpatialPolygons(ohio_map@polygons)
+plot(ohio_poly, axes = TRUE)
+plot(ohio_poly[Kcluster], add = TRUE, col = "red")
+title("Most Likely Cluster")
+```
+
+#### PROBLEM 3
+In the `geoR` library there are data `ca20` which we will explore/model using various geostatistical techniques.
+
+(a) Examine cloud and binned semi-variograms and comment on the evidence for spatial dependence.
+
+```{r, include = TRUE}
+## Problem 3
+# (a)
+# variogram cloud
+cloudca20 <- variog(ca20, option = "cloud")
+plot(cloudca20, ylab="Semi-variance",xlab="Distance",col="grey",
+     main = "Variogram cloud, constant mean",
+     cex=.4)
+
+# binned semi-variograms
+binca20 <- variog(ca20,uvec=seq(0,5000,100),
+                  trend=~ca20[[3]]$area+ca20[[3]]$altitude)
+plot(binca20,ylab="Semi-variance",xlab="Distance",
+     main = "Binned variogram with linear trend in area andd altitude",
+     cex=.5,col="blue")
+```
+
+*We take area and altitude as predictor variables. The binned semi-variogram was produced with a model that removed the linear effects of area and altitude on calcium content measurements. Based on the binned semi-variogram, we conclude there's spatial correlation.*
+
+(b) Using the semi-variogram examine Monte Carlo intervals for no spatial dependence.
+
+```{r, include = TRUE}
+# (b) 
+geoca20.env <- variog.mc.env(ca20, obj=binca20)
+plot(binca20,env=geoca20.env,
+     main = "Monte Carlo envelops under no spatial dependence",
+     xlab="Distance",ylab="Semi-variance")
+```
+
+*Based on the Monte Carlo envelopes under no spatial dependence, we conclude that there is dependence here.*
+
+(c) Fit an exponential variogram model to these data, using least squares, maximum likelihood and restricted maximum likelihood.
+
+```{r, include = FALSE}
+# (c)
+# estimate the initial values
+phi_est <- -600/log(0.05)
+sigma_est <- 100
+
+#OLS
+olsfit <- variofit(binca20,ini=c(sigma_est, phi_est), weights = "equal")
+olsfit
+
+# WLS
+wlsfit <- variofit(binca20,ini=c(sigma_est, phi_est))
+wlsfit
+
+# Maximum likelihood
+mlfit <- likfit(ca20,ini=c(sigma_est, phi_est),
+                trend=~ca20[[3]]$area+ca20[[3]]$altitude)
+mlfit$parameters.summary
+
+# Restricted maximum likelihood
+remlfit <- likfit(ca20,ini=c(sigma_est, phi_est),lik.method="RML",
+                  trend=~ca20[[3]]$area+ca20[[3]]$altitude)
+remlfit$parameters.summary
+```
+
+*We first give initial estimates for $\sigma^2$ and $\phi$ using the binned variogram: $\tilde{d}$ = 600 to give $\tilde{\phi} = `r phi_est`, $\tilde{\sigma}$ = sigma_est.*
+
+*Then we estimate model parameters using OLS, WLS, maximum likelihood and restricted maximum likelihood.*
+
+- In OLS, we used equal weights and got $\tilde{\tau}^2$ = 41.3137, $\tilde{\sigma}^2$ = 51.6473, and $\tilde{\phi}$ = 105.6286. 
+- Using WLS where we weighted by the number of pairs in each bin, we got $\tilde{\tau}^2$ = 35.8052, $\tilde{\sigma}^2$ = 67.3760, and $\tilde{\phi}$ = 148.1355. 
+- For MLE, we got $\tilde{\tau}^2$ = 0.0000, $\tilde{\sigma}^2$ = 104.3638, and $\tilde{\phi}$ = 73.0004, which are very different from the LS estimates*
+- For RMLE, we got $\tilde{\tau}^2$ = 22.61870, $\tilde{\sigma}^2$ = 137.6734, and $\tilde{\phi}$ = 200.2841*
+
+```{r, include = TRUE}
+plot(binca20,max.dist=1200, xlab="Distance (m)",ylab="Semi-variance",pch=19,cex=.6)
+lines(olsfit,max.dist=1200,col="red")
+lines(wlsfit,max.dist=1200,lty=2,col="green")
+lines(mlfit,max.dist=1200,lty=3,col="blue")
+lines(remlfit,max.dist=1200,lty=4,col="black")
+legend("bottomright",legend=c("OLS","WLS","ML","REML"),
+       lty=c(1,2,3,4),bty="n",col=c("red","green","blue","black"),
+       cex=0.5)
+```
+
+(d) Carry out kriging and examine the resultant surface, both in terms of the mean and the standard deviation.
+
+*We first produced an image plot of the surface of the residuals. To get the estimated mean, we calculate the mean of the observed data points using the coefficients from the ML fit. Then we plot the surface of the mean by adding the predicted residual to the mean value of the observed data points. We see that area close to the observed data points have very small residuals. Lastly. we plot the Kriging standard deviation of the predictions and area close to the observed datapoints have very small SD.*
+
+```{r, include = TRUE}
+# (d)
+# form a geodata object with the residuals as the response
+lmfit <- lm(ca20$data~ca20[[3]]$area+ca20[[3]]$altitude)
+detrend <- as.geodata(cbind(ca20$coords,lmfit$residuals))
+
+# MLE on the detrended data
+mlfit2 <- likfit(detrend,ini=c(sigma_est, phi_est))
+
+# ordinary kriging
+# summary(detrend$coords)
+pred.grid <- expand.grid(seq(4900,6000,l=51), seq(4800, 5800, l=51))
+kc <- krige.conv(detrend,loc=pred.grid, krige=krige.control(obj.m=mlfit2))
+
+# residual plot
+image.plot(x=pred.grid[["Var1"]][1:51],
+           y=unique(pred.grid[["Var2"]]),
+           z=matrix(kc$predict,nrow=51,ncol=51),col=terrain.colors(100),
+           xlab="x-coordinate",ylab="y-coordinate", 
+           main = "Spatial surface of residuals from Kriging")
+symbols(detrend$coords[,1],detrend$coords[,2],
+        circles=(detrend$data-min(detrend$data))/1,add=T,inches=0.04)
+
+# resultant surface of the mean
+m <- mean(lmfit$coefficients[1] + 
+            lmfit$coefficients[2] * (ca20[[3]]$area == 2) + 
+            lmfit$coefficients[3] * (ca20[[3]]$area == 3) + 
+            lmfit$coefficients[4] * ca20[[3]]$altitude) # calculate mean(b0 + b1x_i) using current data
+
+image.plot(x=pred.grid[["Var1"]][1:51],
+           y=unique(pred.grid[["Var2"]]),
+           z=matrix(m + kc$predict,nrow=51,ncol=51),col=terrain.colors(100),
+           xlab="x-coordinate",ylab="y-coordinate", 
+           main = "Kriging: resultant surface of the mean")
+symbols(detrend$coords[,1],detrend$coords[,2],
+        circles=(detrend$data-min(detrend$data))/1,add=T,inches=0.04)
+
+# resultant surface of SD
+image.plot(x=pred.grid[["Var1"]][1:51],
+           y=unique(pred.grid[["Var2"]]),
+           z=matrix(sqrt(kc$krige.var),nrow=51,ncol=51),
+           col=cm.colors(100),
+           xlab="x-coordinate",ylab="y-coordinate",
+           main = "Kriging: resultant surface of SD")
+points(detrend$coords[,1],detrend$coords[,2],pch=16)
+```
+
+
+#### Code
+
+```{r, eval = FALSE, echo = TRUE, include = TRUE}
+## PROBLEM 1
+# (a)
+
+# summarize and merge data based on hw1 solution
+ohio_data <- read.table("C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data/ohio_data-1.txt", header = TRUE, sep = " ")
+ohio_county <- ohio_data %>% group_by(fips) %>%
+  summarise(year = unique(year),
+            deaths = sum(deaths),
+            popn = sum(popn),
+            exp = unique(county_level_E))
+
+ohio_map <- readOGR(dsn = "C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data", layer = "ohio_map")
+ohio_map@data$deaths <- ohio_county$deaths
+ohio_map@data$exp <- ohio_county$exp
+ohio_map@data$popn <- ohio_county$popn
+
+tmp1 <- merge(x = ohio_map@data[,c("STATEFP00",
+                                   "COUNTYFP00",
+                                   "CNTYIDFP00",
+                                   "NAME00")],
+              y = ohio_county,
+              by.x = 'CNTYIDFP00',
+              by.y = 'fips',
+              sort = FALSE)
+
+tmp2 <- ohio_county[match(ohio_map@data$CNTYIDFP00,
+                          ohio_county$fips),]
+tmp2$county_name <- ohio_map@data$NAME00[match(tmp2$fips, ohio_map@data$CNTYIDFP00)]
+ohio_county <- tmp2
+rm(tmp1, tmp2)
+
+# create a neighborhood list
+ohio.nb <- poly2nb(ohio_map)
+
+# evaluate moran's test
+col.W <- nb2listw(ohio.nb, style = "W", zero.policy = TRUE)
+quasipmod <- glm(deaths~1,offset=log(exp),
+                 data=ohio_map@data,family=quasipoisson())
+sidsres <- residuals(quasipmod,type="pearson")
+m.test <- moran.test(sidsres,col.W)
+p <- m.test$p.value
+
+#map the residuals to get a visual on the clustering
+ohio_map$res <- sidsres
+par(mar=c(.1,.1,.1,.1))
+spplot(ohio_map,"res", main=list(label="Map of residuals (no clustering detected)",cex=1.5))
+
+g.test <- geary.test(sidsres, col.W)
+p <- g.test$p.value
+
+## problem 2
+# geo <- for(i in 1:88){ohio_map@polygons[[i]]@labpt}
+# gCentroid
+geo <- latlong2grid(coordinates(ohio_map))
+
+# referencep <- sum(ohio_map@data$deaths)/sum(ohio_map@data$popn)
+population <- ohio_map@data$popn
+cases <- ohio_map@data$deaths
+expected <- ohio_map@data$exp
+
+#significance level of 0.05, and a maximum population size of 20%
+pop.upper.bound <- 0.2
+n.simulations <- 1000
+alpha.level <- 0.05
+
+#StatScan
+Kpoisson <- kulldorff(geo,cases,population,expected.cases=NULL, 
+                      pop.upper.bound, n.simulations, alpha.level, plot=T)
+Kcluster <- Kpoisson$most.likely.cluster$location.IDs.included
+
+# plot
+ohio_poly = SpatialPolygons(ohio_map@polygons)
+plot(ohio_poly, axes = TRUE)
+plot(ohio_poly[Kcluster], add = TRUE, col = "red")
+title("Most Likely Cluster")
+
+## Problem 3
+# (a)
+# variogram cloud
+cloudca20 <- variog(ca20, option = "cloud")
+plot(cloudca20, ylab="Semi-variance",xlab="Distance",col="grey",
+     main = "Variogram cloud, constant mean",
+     cex=.4)
+
+# binned semi-variograms
+binca20 <- variog(ca20,uvec=seq(0,5000,100),
+                  trend=~ca20[[3]]$area+ca20[[3]]$altitude)
+plot(binca20,ylab="Semi-variance",xlab="Distance",
+     main = "Binned variogram with linear trend in area andd altitude",
+     cex=.5,col="blue")
+
+# (b) 
+geoca20.env <- variog.mc.env(ca20, obj=binca20)
+plot(binca20,env=geoca20.env,
+     main = "Monte Carlo envelops under no spatial dependence",
+     xlab="Distance",ylab="Semi-variance")
+
+# (c)
+# estimate the initial values
+phi_est <- -600/log(0.05)
+sigma_est <- 100
+
+#OLS
+olsfit <- variofit(binca20,ini=c(sigma_est, phi_est), weights = "equal")
+olsfit
+
+# WLS
+wlsfit <- variofit(binca20,ini=c(sigma_est, phi_est))
+wlsfit
+
+# Maximum likelihood
+mlfit <- likfit(ca20,ini=c(sigma_est, phi_est),
+                trend=~ca20[[3]]$area+ca20[[3]]$altitude)
+mlfit$parameters.summary
+
+# Restricted maximum likelihood
+remlfit <- likfit(ca20,ini=c(sigma_est, phi_est),lik.method="RML",
+                  trend=~ca20[[3]]$area+ca20[[3]]$altitude)
+remlfit$parameters.summary
+
+plot(binca20,max.dist=1200, xlab="Distance (m)",ylab="Semi-variance",pch=19,cex=.6)
+lines(olsfit,max.dist=1200,col="red")
+lines(wlsfit,max.dist=1200,lty=2,col="green")
+lines(mlfit,max.dist=1200,lty=3,col="blue")
+lines(remlfit,max.dist=1200,lty=4,col="black")
+legend("bottomright",legend=c("OLS","WLS","ML","REML"),
+       lty=c(1,2,3,4),bty="n",col=c("red","green","blue","black"),
+       cex=0.5)
+
+# (d)
+# form a geodata object with the residuals as the response
+lmfit <- lm(ca20$data~ca20[[3]]$area+ca20[[3]]$altitude)
+detrend <- as.geodata(cbind(ca20$coords,lmfit$residuals))
+
+# MLE on the detrended data
+mlfit2 <- likfit(detrend,ini=c(sigma_est, phi_est))
+
+# ordinary kriging
+# summary(detrend$coords)
+pred.grid <- expand.grid(seq(4900,6000,l=51), seq(4800, 5800, l=51))
+kc <- krige.conv(detrend,loc=pred.grid, krige=krige.control(obj.m=mlfit2))
+
+# residual plot
+image.plot(x=pred.grid[["Var1"]][1:51],
+           y=unique(pred.grid[["Var2"]]),
+           z=matrix(kc$predict,nrow=51,ncol=51),col=terrain.colors(100),
+           xlab="x-coordinate",ylab="y-coordinate", 
+           main = "Spatial surface of residuals from Kriging")
+symbols(detrend$coords[,1],detrend$coords[,2],
+        circles=(detrend$data-min(detrend$data))/1,add=T,inches=0.04)
+
+# resultant surface of the mean
+m <- mean(lmfit$coefficients[1] + 
+            lmfit$coefficients[2] * (ca20[[3]]$area == 2) + 
+            lmfit$coefficients[3] * (ca20[[3]]$area == 3) + 
+            lmfit$coefficients[4] * ca20[[3]]$altitude) # calculate mean(b0 + b1x_i) using current data
+
+image.plot(x=pred.grid[["Var1"]][1:51],
+           y=unique(pred.grid[["Var2"]]),
+           z=matrix(m + kc$predict,nrow=51,ncol=51),col=terrain.colors(100),
+           xlab="x-coordinate",ylab="y-coordinate", 
+           main = "Kriging: resultant surface of the mean")
+symbols(detrend$coords[,1],detrend$coords[,2],
+        circles=(detrend$data-min(detrend$data))/1,add=T,inches=0.04)
+
+# resultant surface of SD
+image.plot(x=pred.grid[["Var1"]][1:51],
+           y=unique(pred.grid[["Var2"]]),
+           z=matrix(sqrt(kc$krige.var),nrow=51,ncol=51),
+           col=cm.colors(100),
+           xlab="x-coordinate",ylab="y-coordinate",
+           main = "Kriging: resultant surface of SD")
+points(detrend$coords[,1],detrend$coords[,2],pch=16)
+```

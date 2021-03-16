@@ -1,0 +1,241 @@
+---
+title: "BIOST/EPI 554 Problem Set 1"
+author: "Yichen Lu"
+date: "2/3/2021"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+# rm(list = ls())
+knitr::opts_chunk$set(echo = FALSE, include=TRUE)
+library(SpatialEpi)
+library(RColorBrewer)
+library(ggplot2)
+library(ggridges)
+library(INLA)
+library(rgdal)
+library(spdep)
+library(dplyr)
+options("scipen"=100)
+```
+
+## PROBLEM 1
+(a) Provide a map of the observed counts $Y_i$.
+```{r, include = FALSE}
+# read the data
+dt_raw <- read.table("C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data/ohio_data-1.txt", header = TRUE, sep = " ")
+
+# summarize the total event by fips
+dt <- dt_raw %>% group_by(fips, year) %>% 
+  summarize(cases = sum(deaths), pop = sum(popn), expected = mean(county_level_E))
+dt$SMR <- dt$cases/dt$expected
+
+# read the map
+map <- readOGR(dsn = "C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data", layer = "ohio_map")
+
+# connect the data in map to the event data
+dt$CNTYIDFP00 <- as.character(dt$fips)
+map@data <- map@data %>% left_join(dt, by = "CNTYIDFP00")
+```
+
+```{r}
+spplot(map, zcol="cases",col.regions=brewer.pal(9,"Purples"),cuts=8,
+       main=list(label="Map of the observed counts",cex=1.5))
+```
+
+
+(b) Provide a map of the expected counts $E_i$.
+
+```{r}
+spplot(map, zcol="expected",col.regions=brewer.pal(9,"Blues"),cuts=8,
+       main=list(label="Map of the expected counts",cex=1.5))
+```
+
+
+(c) Provide a map of the SMRs.
+
+```{r}
+spplot(map, zcol="SMR",col.regions=brewer.pal(9,"Greens"),cuts=8,
+       main=list(label="Map of the SMRs",cex=1.5))
+```
+
+
+## PROBLEM 2
+(a) Using the `inla` function in R fit this model using the default priors for $\beta_{0}$ and $\sigma_{e}$. Report the posterior medians and 95% intervals for $\beta_{0}$ and $\sigma_{e}$.
+```{r, include = FALSE}
+fit1 <- inla(cases ~ 1 + f(CNTYIDFP00, model="iid"),
+             data = map@data, family="poisson", E=expected,
+             control.predictor = list(compute = TRUE)) 
+
+# extract the posterior medians and 95% intervals
+beta_median <- round(fit1$summary.fixed$"0.5quant", 3)
+beta_ci <- paste0("(", round(fit1$summary.fixed$"0.025quant", 3), ", ", round(fit1$summary.fixed$"0.975quant", 3), ")")
+
+sigma_median <- round(sqrt(1/fit1$summary.hyperpar$"0.5quant"), 3)
+sigma_ci <- paste0("(", round(sqrt(1/fit1$summary.hyperpar$"0.025quant"), 3), ", ", round(sqrt(1/fit1$summary.hyperpar$"0.975quant"), 3), ")")
+```
+
+*The posterior medians for $\beta_{0}$ is `r beta_median`, and 95% intervals is `r beta_ci`. The posterior medians for $\sigma_{e}$ is `r sigma_median`, and 95% intervals is `r sigma_ci`. *
+
+(b) Extract the relative risk estimates and provide a map of these.
+
+```{r}
+fit1fitted <- fit1$summary.fitted.values$"0.5quant"
+map@data <- cbind(map@data, "fit1mean" = fit1fitted)
+spplot(map, zcol="fit1mean",col.regions=brewer.pal(9,"Greens"),cuts=8,
+       main=list(label="Map of the relative risk estimates",cex=1.5))
+```
+
+## PROBLEM 3
+(a) Report both the posterior medians and 95% intervals for $\beta_{0}$, the total variance of the random effects, and the proportion of the total variance attributed to the spatial random effect
+
+```{r, include = FALSE}
+map@data$county = seq(1:nrow(map@data))
+formula <- cases ~ 1 +  
+  f(county, model="bym2",graph="C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data/ohio_map.graph",
+    scale.model=T, constr=T,
+    hyper=list(phi=list(prior="pc", param=c(0.5,0.5), initial=1),
+               prec=list(prior="pc.prec", param=c(0.3,0.01),initial=5)))
+
+# fit inla
+fit2 <- inla(formula, 
+             data=map@data, family="poisson",E = expected,
+             control.predictor=list(compute=TRUE),
+             control.compute=list(config = TRUE))
+
+# extract the posterior medians and 95% intervals
+beta_median <- round(fit2$summary.fixed$"0.5quant", 3)
+beta_ci <- paste0("(", round(fit2$summary.fixed$"0.025quant", 3), ", ", round(fit2$summary.fixed$"0.975quant", 3), ")")
+
+sigma_median <- round(1/fit2$summary.hyperpar$"0.5quant"[1], 3)
+sigma_ci <- paste0("(", round(1/fit2$summary.hyperpar$"0.025quant"[1], 3), ", ", round(1/fit2$summary.hyperpar$"0.975quant"[1], 3), ")")
+
+prop_median <- round(fit2$summary.hyperpar$"0.5quant"[2], 3)
+prop_ci <- paste0("(", round(fit2$summary.hyperpar$"0.975quant"[2], 3), ", ", round(fit2$summary.hyperpar$"0.025quant"[2], 3), ")")
+```
+
+*The posterior medians for $\beta_{0}$ is `r beta_median`, and 95% intervals is `r beta_ci`. The posterior medians for the total variance is `r sigma_median`, and 95% intervals is `r sigma_ci`. The posterior medians for the proportion of the total variance attributed to the spatial random effect is `r prop_median`, and 95% intervals is `r prop_ci`.*
+
+(b) Extract the relative risk estimates and provide a map of these.
+
+```{r}
+fit2fitted <- fit2$summary.fitted.values$"0.5quant"
+map@data <- cbind(map@data, "fit2mean" = fit2fitted)
+spplot(map, zcol="fit2mean",col.regions=brewer.pal(9,"Greens"),cuts=8,
+       main=list(label="Map of the relative risk estimates",cex=1.5))
+```
+
+Compare these estimates with the SMRs and with those obtained from the Poisson-Lognormal model (i.e., the model with IID random effects only) that you fit in Question 2.
+
+*We plotted the posterior median from the Poisson-Lognormal-Spatial model against the SMRs and those obtained from the Poisson-Lognormal model. We see that for SMR < 1, the posterior median from the Poisson-Lognormal-Spatial model is smaller than SMR. For SMR > 1, the posterior median from the Poisson-Lognormal-Spatial model is larger than SMR. Additionally, the posterior median from the Poisson-Lognormal-Spatial model and the the posterior median from the Poisson-Lognormal model are similar. For posterior median from the Poisson-Lognormal model < 0.9, the posterior median from the Poisson-Lognormal-Spatial model is slightly larger. For posterior median from the Poisson-Lognormal model > 1.1, the posterior median from the Poisson-Lognormal-Spatial model is slightly smaller.*
+
+```{r}
+ggplot(data.frame(pmedian=fit1fitted, smr = map@data$SMR),
+       aes(y=smr,x=pmedian)) + geom_point() + labs(title = "Posterior Median from the Poisson-Lognormal-Spatial model vs SMR", y="Posterior Median from the \n Poisson-Lognormal-Spatial model ",x="SMR") + geom_abline(intercept=0,slope=1,color="red") + xlim(0.25, 1.75) + ylim(0.25, 1.75)
+
+ggplot(data.frame(pmedian=fit2fitted, pmedian1 = fit1fitted),
+       aes(y=pmedian1, x=pmedian)) + geom_point() + 
+  labs(title = "Posterior Median from the Poisson-Lognormal-Spatial model\n vs Poisson-Lognormal model", y="Posterior Median from the \nPoisson-Lognormal-Spatial model", x="Posterior Median from the Poisson-Lognormal model") + geom_abline(intercept=0,slope=1,color="red") + xlim(0.75, 1.25) + ylim(0.75, 1.25)
+```
+
+## Code
+```{r, eval = FALSE, echo = TRUE}
+library(SpatialEpi)
+library(RColorBrewer)
+library(ggplot2)
+library(ggridges)
+library(INLA)
+library(rgdal)
+library(spdep)
+library(dplyr)
+options("scipen"=100)
+
+# read the data
+dt_raw <- read.table("C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data/ohio_data-1.txt", header = TRUE, sep = " ")
+
+# summarize the total event by fips
+dt <- dt_raw %>% group_by(fips, year) %>% 
+  summarize(cases = sum(deaths), pop = sum(popn), expected = mean(county_level_E))
+dt$SMR <- dt$cases/dt$expected
+
+# read the map
+map <- readOGR(dsn = "C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data", layer = "ohio_map")
+
+# connect the data in map to the event data
+dt$CNTYIDFP00 <- as.character(dt$fips)
+map@data <- map@data %>% left_join(dt, by = "CNTYIDFP00")
+
+## PROBLEM 1
+# Provide a map of the observed counts Y_i
+spplot(map, zcol="cases",col.regions=brewer.pal(9,"Purples"),cuts=8,
+       main=list(label="Map of the observed counts",cex=1.5))
+
+# Provide a map of the expected counts E_i.
+spplot(map, zcol="expected",col.regions=brewer.pal(9,"Blues"),cuts=8,
+       main=list(label="Map of the expected counts",cex=1.5))
+
+# Provide a map of the SMRs.
+spplot(map, zcol="SMR",col.regions=brewer.pal(9,"Greens"),cuts=8,
+       main=list(label="Map of the SMRs",cex=1.5))
+
+## PROBLEM 2: Poisson-Lognormal
+fit1 <- inla(cases ~ 1 + f(CNTYIDFP00, model="iid"),
+             data = map@data, family="poisson", E=expected,
+             control.predictor = list(compute = TRUE)) 
+
+# extract the posterior medians and 95% intervals
+beta_median <- round(fit1$summary.fixed$"0.5quant", 3)
+beta_ci <- paste0("(", round(fit1$summary.fixed$"0.025quant", 3), ", ", round(fit1$summary.fixed$"0.975quant", 3), ")")
+
+sigma_median <- round(sqrt(1/fit1$summary.hyperpar$"0.5quant"), 3)
+sigma_ci <- paste0("(", round(sqrt(1/fit1$summary.hyperpar$"0.025quant"), 3), ", ", round(sqrt(1/fit1$summary.hyperpar$"0.975quant"), 3), ")")
+
+# Extract the relative risk estimates and provide a map of these.
+fit1fitted <- fit1$summary.fitted.values$"0.5quant"
+map@data <- cbind(map@data, "fit1mean" = fit1fitted)
+spplot(map, zcol="fit1mean",col.regions=brewer.pal(9,"Greens"),cuts=8,
+       main=list(label="Map of the relative risk estimates",cex=1.5))
+
+## PROBLEM 3: Poisson-Lognormal-Spatial
+map@data$county = seq(1:nrow(map@data))
+formula <- cases ~ 1 +  
+  f(county, model="bym2",graph="C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/data/ohio_map.graph",
+    scale.model=T, constr=T,
+    hyper=list(phi=list(prior="pc", param=c(0.5,0.5), initial=1),
+               prec=list(prior="pc.prec", param=c(0.3,0.01),initial=5)))
+
+# fit inla
+fit2 <- inla(formula, 
+             data=map@data, family="poisson",E = expected,
+             control.predictor=list(compute=TRUE),
+             control.compute=list(config = TRUE))
+
+# extract the posterior medians and 95% intervals
+# extract the posterior medians and 95% intervals
+beta_median <- round(fit2$summary.fixed$"0.5quant", 3)
+beta_ci <- paste0("(", round(fit2$summary.fixed$"0.025quant", 3), ", ", round(fit2$summary.fixed$"0.975quant", 3), ")")
+
+sigma_median <- round(1/fit2$summary.hyperpar$"0.5quant"[1], 3)
+sigma_ci <- paste0("(", round(1/fit2$summary.hyperpar$"0.025quant"[1], 3), ", ", round(1/fit2$summary.hyperpar$"0.975quant"[1], 3), ")")
+
+prop_median <- round(fit2$summary.hyperpar$"0.5quant"[2], 3)
+prop_ci <- paste0("(", round(fit2$summary.hyperpar$"0.975quant"[2], 3), ", ", round(fit2$summary.hyperpar$"0.225quant"[2], 3), ")")
+
+# Extract the relative risk estimates and provide a map of these.
+fit2fitted <- fit2$summary.fitted.values$"0.5quant"
+map@data <- cbind(map@data, "fit2mean" = fit2fitted)
+spplot(map, zcol="fit2mean",col.regions=brewer.pal(9,"Greens"),cuts=8,
+       main=list(label="Map of the relative risk estimates",cex=1.5))
+
+# Compare these estimates with the SMRs and with those obtained from the Poisson-Lognormal model (i.e., the model with IID random effects only) that you fit in Question 2.
+ggplot(data.frame(pmedian=fit1fitted, smr = map@data$SMR),
+       aes(y=smr,x=pmedian)) + geom_point() + labs(title = "Posterior Median from the Poisson-Lognormal-Spatial model vs SMR", y="Posterior Median from the \n Poisson-Lognormal-Spatial model ",x="SMR") + geom_abline(intercept=0,slope=1,color="red") + xlim(0.25, 1.75) + ylim(0.25, 1.75)
+
+ggplot(data.frame(pmedian=fit2fitted, pmedian1 = fit1fitted),
+       aes(y=pmedian1, x=pmedian)) + geom_point() + 
+  labs(title = "Posterior Median from the Poisson-Lognormal-Spatial model\n vs Poisson-Lognormal model", y="Posterior Median from the \nPoisson-Lognormal-Spatial model", x="Posterior Median from the Poisson-Lognormal model") + geom_abline(intercept=0,slope=1,color="red") + xlim(0.75, 1.25) + ylim(0.75, 1.25)
+```
+

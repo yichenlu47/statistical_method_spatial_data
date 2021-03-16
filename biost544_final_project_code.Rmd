@@ -1,0 +1,185 @@
+---
+title: "biost544_final_project_code"
+author: "Yichen Lu"
+date: "3/6/2021"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(urbnmapr)
+library(SpatialEpi)
+library(RColorBrewer)
+library(ggplot2)
+library(ggridges)
+library(geoR)
+library(rgdal)
+library(spdep)
+library(dplyr)
+library(plyr)
+library(tmap)
+library(sp)
+library(spdep)
+library("readxl")
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+knitr::opts_knit$set(root.dir = 'C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/BIOST554/project/')
+```
+
+### Load data
+
+```{r}
+# percentage of Medicare enrollment
+pa <- read.csv("pa_reimb_county_2015_age_sex_race-adjusted.csv", sep = ",", header = TRUE)
+pa$fips = ifelse(nchar(as.character(pa$County.ID)) == 4, 
+                 paste0("0",as.character(pa$County.ID)), as.character(pa$County.ID))
+names(pa)[names(pa) == "Medicare.enrollees..2015."] <- "n_med"
+pa1 <- pa[, c("fips", "n_med")]
+
+# percentage of adults with less than a high school diploma
+edu <- read_excel("Education.xls", skip = 4)
+edu1 <- edu[!is.na(edu$"2013 Rural-urban Continuum Code"), c("FIPS Code", "Percent of adults with less than a high school diploma, 2015-19")] 
+colnames(edu1) <- c("fips", "pct_less_high_sch")
+edu1$pct_less_high_sch = edu1$pct_less_high_sch/100
+
+# percentage of unemployment
+unemploy <- read_excel("Unemployment.xls", sheet = "Unemployment Med HH Income", skip = 4)
+names(unemploy)[names(unemploy) == "fips_txt"] <- "fips"
+unemploy$pct_unemploy <- unemploy$Unemployment_rate_2015/100
+unemploy1 <- unemploy[!is.na(unemploy$"Rural_urban_continuum_code_2013"), c("fips", "pct_unemploy")]
+
+# population by county
+pop_long <- read.csv("cc-est2019-alldata.csv", sep = ",", header = TRUE)
+
+# extract elderly population >= 65 years old in 2014
+pop_2015 <- pop_long[pop_long$YEAR == 8 & pop_long$AGEGRP >= 14, ] %>%  # 8 = 7/1/2015 population estimate
+  mutate(fips = paste0(ifelse(nchar(STATE) == 1, paste0("0", STATE), STATE), 
+                       ifelse(nchar(COUNTY) == 1, paste0("00", COUNTY), 
+                              ifelse(nchar(COUNTY) == 2, paste0("0", COUNTY), 
+                                     COUNTY)))) %>% select(c("fips", "AGEGRP" , "TOT_POP", "TOT_FEMALE"))
+
+# number of females >= 65 years old
+pop_geq_65 <- pop_2015 %>% group_by(fips) %>% 
+  dplyr::summarize(n_geq_65 = sum(TOT_POP), n_geq_65_female = sum(TOT_FEMALE))
+```
+
+
+### Final dataset for analysis
+
+```{r}
+# final dataset with all threecovariates
+dt <- join_all(list(pa1, pop_geq_65, edu1, unemploy1), by = "fips") %>% filter(!is.na(n_med) & !is.na(n_geq_65))
+
+# create new variables
+dt$pct_med = dt$n_med / dt$n_geq_65 # percemtage of Medicare enrollment
+dt$exp_n_med <- sum(dt$n_med) / sum(dt$n_geq_65) * dt$n_geq_65 # expected number of Medicare enrollees
+dt$smr <- dt$n_med/dt$exp_n_med # standarized enrollment rate
+dt$pct_geq_65_female = dt$n_geq_65_female/dt$n_geq_65 # percentage of females
+```
+
+
+### Summary statistics
+
+```{r}
+# spatial data: county
+dt_map <- st_read("ncovr/ncovr/NAT.shp")
+dt_map$fips = dt_map$FIPS
+
+dt2 <- dt_map %>% select(fips) %>% left_join(dt, by = "fips")
+dt2_complete <- dt2[!is.na(dt2$pct_med) & dt2$pct_med < 1,]
+
+# summary statistics 
+summary(dt2_complete$pct_med)
+sd(dt2_complete$pct_med)
+
+summary(dt2_complete$pct_geq_65_female)
+sd(dt2_complete$pct_geq_65_female)
+
+summary(dt2_complete$pct_less_high_sch)
+sd(dt2_complete$pct_less_high_sch)
+
+summary(dt2_complete$pct_unemploy)
+sd(dt2_complete$pct_unemploy)
+
+summary(dt2_complete$smr)
+sum(dt2_complete$smr > 1)
+sum(dt2_complete$smr > 1)/nrow(dt2_complete)
+```
+
+
+### Non-spatial simple linear regression
+
+```{r}
+dt2_complete$pct_med_trans <- asin(dt2_complete$pct_med)
+fit1 <- lm(pct_med_trans ~ pct_geq_65_female + pct_less_high_sch +  pct_unemploy, dt2_complete)
+summary(fit1)
+```
+
+### Moran's I statistic and 
+
+```{r}
+dt2_sp <- as(dt2_complete, "Spatial") # coerce the sf object into a new sp object
+neighbs <- poly2nb(dt2_sp, row.names=dt2_sp$fips) # create graph file
+
+
+adj_mat <- nb2mat(neighbs, style = 'W', zero.policy=TRUE) # create adjacency matrix
+
+# create weights matrices
+neighbs.W <- nb2listw(neighbs, style="W", zero.policy=TRUE) 
+neighbs.B <- nb2listw(neighbs, style="B", zero.policy=TRUE)
+
+lm.morantest(fit1, neighbs.B, alternative="two.sided")
+lm.morantest(fit1, neighbs.W, alternative="two.sided")
+```
+
+
+### Lagrange multiplier tests
+
+```{r}
+lm.LMtests(fit1, neighbs.W, test = c("LMerr","LMlag","RLMerr","RLMlag"))
+```
+
+
+# Spatial error regression
+
+```{r}
+fit_err <- errorsarlm(pct_med_trans ~ pct_geq_65_female + pct_less_high_sch +  pct_unemploy, data=dt2_sp, neighbs.W)
+summary(fit_err)
+```
+
+
+# Spatial lag regression
+
+```{r}
+fit_lag <- lagsarlm(pct_med_trans ~ pct_geq_65_female + pct_less_high_sch +  pct_unemploy, data=dt2_sp, neighbs.W)
+summary(fit_lag)
+```
+
+
+### Extract residuals
+
+```{r}
+summary(fit1$residuals)
+summary(fit_err$residuals)
+summary(fit_lag$residuals)
+
+dt2_complete$lm_residuals = fit1$residuals
+dt2_complete$err_residuals = fit_err$residuals
+dt2_complete$lag_residuals = fit_lag$residuals
+```
+
+
+### Linear equations
+
+$$
+y = \beta_1X_1 + \beta_2X_2 + \beta_3X_3 + \epsilon\\
+y = \beta X + \epsilon\\
+
+y = \beta X + u\\
+u = \lambda W u + \epsilon \\
+
+y = \beta X + \rho Wy + \epsilon\\
+E[\epsilon] = 0, Cov(\epsilon) = \sigma^2 I \\
+$$
